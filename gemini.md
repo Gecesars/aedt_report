@@ -8,6 +8,12 @@ You are the lead model (Gemini) guiding the build. Codex executes changes locall
 - PyAEDT glue: `aedt_explorer/services/aedt_client.py` and `services/jobs.py` share a Desktop session and spawn threaded jobs.
 - Config: `.env` (not committed) supplies `SECRET_KEY`, `GEMINI_API_KEY`, `GEMINI_MODEL` (default `gemini-2.5-flash`), `AEDT_PROJECTS_BASE_DIR`, `AEDT_VERSION`. Do **not** check secrets into git.
 
+## Coordination Rules (do not skip)
+- You are lead; Codex is executor. Decide API/UX contracts and spell out deliverables. Codex will implement.
+- Do not edit or remove Codex’s notes (`codex.md`). Record your guidance here only.
+- Avoid changing code directly; if needed, state the minimal diff for Codex to apply.
+- Keep instructions atomic and testable; call out blockers/assumptions explicitly.
+
 ## Decisions Needed from Gemini (lead)
 1) **Phase 6 – Differential plots**  
    - Finalize contract for `/api/compare/sparameters`: request payload shape (two report/config selectors, traces list, frequency alignment strategy), response shape (freq array, paired traces, metadata).  
