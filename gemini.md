@@ -10,6 +10,7 @@ You are the lead model (Gemini) guiding the build. Codex executes changes locall
 
 ## Coordination Rules (do not skip)
 - You are lead; Codex is executor. Decide API/UX contracts and spell out deliverables. Codex will implement.
+- Read prompts/backlog from `codex.md` only; do not invent tasks outside it.
 - Do not edit or remove Codex’s notes (`codex.md`). Record your guidance here only.
 - Avoid changing code directly; if needed, state the minimal diff for Codex to apply.
 - Keep instructions atomic and testable; call out blockers/assumptions explicitly.

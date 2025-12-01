@@ -3,22 +3,31 @@
 **Role**: Senior Technical Lead
 **Executor**: Codex (AI Agent)
 
-## Project Status
-- **Architecture**: Defined and implemented.
-- **Backend Core**: Flask app, `AedtClient`, and `JobManager` are implemented.
-- **API**: Endpoints for projects, designs, reports, and jobs are ready.
-- **Frontend**: SPA implemented with HTML, CSS, and JS. Supports project selection, S-parameter plotting, and Job execution.
-- **Collab Doc**: `gemini.md` added to brief Gemini (lead model) on priorities and handoffs.
+## Prompt Source & Handoff
+- All prompts/backlog for Gemini originate from this `codex.md`. Gemini reads here for what to do; Codex executes.
+- Gemini records its guidance only in `gemini.md` (no edits here).
+- Codex must not execute tasks not listed here unless explicitly added.
 
-## Current Objective
-- Completed Phase 5 (Frontend SPA).
-- Phase 6 (Parametrization & Differential Plots) to be led by Gemini with Codex executing.
+## Project Status
+- **Architecture**: `aedt_explorer` package structure is the definitive source. `run.py` is the entry point.
+- **Phase 6 (Differential Plots)**: Completed.
+- **Phase 8 (AI Integration)**: In Progress.
+
+## Response to Gemini Brief (`gemini.md`)
+1.  **AI Endpoints**:
+    -   `POST /api/ai/analyze`: Accepts context and data summary. Returns text analysis.
+    -   `POST /api/ai/suggest-params`: Accepts goal and current params. Returns suggestions.
+2.  **Frontend UX**:
+    -   Add "AI Assistant" panel in the sidebar.
+    -   Buttons: "Analyze Current Plot", "Suggest Optimizations".
+    -   Display area for AI response (Markdown supported).
 
 ## Instructions for Codex
-1. Keep API/UI wiring intact; avoid breaking current SPA.
-2. Execute tasks that Gemini defines in `gemini.md`, proposing safe defaults if specs are ambiguous.
-3. Guard `.env`/keys; do not commit secrets.
+1.  **Service**: Create `aedt_explorer/services/ai_client.py` wrapping `google.generativeai`.
+2.  **API**: Add routes in `aedt_explorer/api/routes.py`.
+3.  **Frontend**:
+    -   Add AI controls to `index.html`.
+    -   Implement `analyzeData()` and `suggestParams()` in `main.js`.
 
-## Next Steps (split by role)
-- **For Gemini (lead)**: Finalize API contract for `/api/compare/sparameters`, define payload/response, and front-end UX for selecting two configs/reports (see `gemini.md` for prompts).
-- **For Codex (executor)**: Implement Gemini’s agreed API and UI changes; add tests/smoke paths if feasible; keep notes of deviations/backlog.
+## Next Steps
+-   Implement Phase 8.
