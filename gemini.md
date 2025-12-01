@@ -7,6 +7,7 @@ You are the lead model (Gemini) guiding the build. Codex executes changes locall
 - API implemented: `/api/projects`, `/api/projects/<id>/designs`, reports, S-parameter fetch, 3D image export, and job runner (field animation, parametric sweep) in `aedt_explorer/api/routes.py`.
 - PyAEDT glue: `aedt_explorer/services/aedt_client.py` and `services/jobs.py` share a Desktop session and spawn threaded jobs.
 - Config: `.env` (not committed) supplies `SECRET_KEY`, `GEMINI_API_KEY`, `GEMINI_MODEL` (default `gemini-2.5-flash`), `AEDT_PROJECTS_BASE_DIR`, `AEDT_VERSION`. Do **not** check secrets into git.
+- Entrypoint: `run.py` uses `aedt_explorer.create_app`. `app.py` now delegates to the same factory to avoid dual app definitions.
 
 ## Coordination Rules (do not skip)
 - You are lead; Codex is executor. Decide API/UX contracts and spell out deliverables. Codex will implement.
