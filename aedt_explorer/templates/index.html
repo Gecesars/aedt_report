@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AEDT Project Explorer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <!-- Plotly CDN -->
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+
+<body>
+    <div id="app">
+        <header>
+            <h1>AEDT Project Explorer</h1>
+        </header>
+        <div class="container">
+            <aside class="sidebar">
+                <h2>Controls</h2>
+                <div id="controls">
+                    <!-- Controls will be injected here by JS -->
+                    <p>Loading projects...</p>
+                </div>
+            </aside>
+            <main class="content">
+                <div id="plot-container"></div>
+                <div id="media-container">
+                    <img id="model-3d" style="display:none; max-width: 100%;">
+                    <video id="model-video" controls style="display:none; max-width: 100%;"></video>
+                </div>
+            </main>
+        </div>
+    </div>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+
+</html>

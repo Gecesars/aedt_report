@@ -1,0 +1,894 @@
+from __future__ import annotations
+
+import io
+import json
+import math
+import re
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Sequence
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from pypdf import PdfReader, PdfWriter
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+import google.generativeai as genai
+from flask import current_app
+from reportlab.platypus import Table, TableStyle
+from reportlab.lib.utils import ImageReader
+
+from ..extensions import db
+from ..models import Project, ProjectExport, PatternType
+from .metrics import (
+    directivity_2d_cut,
+    estimate_gain_dbi,
+    first_null_deg,
+    front_to_back_db,
+    hpbw_deg,
+    lin_to_db,
+    lin_to_att_db,
+    peak_angle_deg,
+    ripple_p2p_db,
+    sidelobe_level_db,
+)
+from .pattern_composer import (
+    get_composition,
+    resample_pattern,
+    resample_vertical,
+)
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+
+def resource_path(relative_path: str) -> Path:
+    return (BASE_DIR / relative_path).resolve()
+
+
+def _draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float = 12, font_name: str = "Helvetica", font_size: int = 10) -> float:
+    c.setFont(font_name, font_size)
+    lines = []
+    for paragraph in (text or "").splitlines():
+        if not paragraph.strip():
+            lines.append("")
+            continue
+        words = paragraph.split()
+        cur = ""
+        for w in words:
+            test = (cur + (" " if cur else "") + w)
+            if c.stringWidth(test, font_name, font_size) <= max_width:
+                cur = test
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+    for ln in lines:
+        c.drawString(x, y, ln)
+        y -= line_height
+    return y
+
+
+def _build_gemini_description(project: Project, metrics: dict | None) -> str:
+    # mantido para fallback apenas
+    try:
+        genai.configure(api_key=current_app.config.get("GEMINI_API_KEY"))
+        model = genai.GenerativeModel(current_app.config.get("GEMINI_MODEL", "gemini-2.5-flash"))
+    except Exception:
+        model = None
+
+    user = project.owner
+    cable = project.cable
+    payload = {
+        "projeto": project.name,
+        "usuario": {
+            "nome": getattr(user, "full_name", None),
+            "email": getattr(user, "email", None),
+            "telefone": getattr(user, "phone", None),
+            "endereco": {
+                "linha": getattr(user, "address_line", None),
+                "cidade": getattr(user, "city", None),
+                "estado": getattr(user, "state", None),
+                "cep": getattr(user, "postal_code", None),
+                "pais": getattr(user, "country", None),
+            },
+        },
+        "antena": {
+            "nome": project.antenna.name,
+            "modelo": project.antenna.model_number,
+            "ganho_nominal_dbd": project.antenna.nominal_gain_dbd,
+            "faixa_mhz": [project.antenna.frequency_min_mhz, project.antenna.frequency_max_mhz],
+        },
+        "sistema": {
+            "frequencia_mhz": project.frequency_mhz,
+            "potencia_tx_w": project.tx_power_w,
+            "altura_torre_m": project.tower_height_m,
+        },
+        "composicao": {
+            "vertical": {
+                "elementos": project.v_count,
+                "delta_v_m": project.v_spacing_m,
+                "tilt_deg": project.v_tilt_deg,
+                "beta_deg": project.v_beta_deg,
+            },
+            "horizontal": {
+                "elementos": project.h_count,
+                "raio_m": project.h_spacing_m,
+                "step_deg": project.h_step_deg,
+                "beta_deg": project.h_beta_deg,
+            },
+        },
+        "cabo": {
+            "modelo": (cable.model_code if cable else project.cable_type),
+            "nome": (cable.display_name if cable else None),
+            "fabricante": (cable.manufacturer if cable else None),
+            "impedancia_ohms": (cable.impedance_ohms if cable else None),
+            "comprimento_m": project.cable_length_m,
+            "perda_splitter_db": project.splitter_loss_db,
+            "perda_conectores_db": project.connector_loss_db,
+            "perda_total_db": project.feeder_loss_db,
+        },
+        "metricas": metrics or {},
+        "observacoes": project.notes,
+    }
+
+    prompt = (
+        "Você é um engenheiro PhD em RF e antenas. Redija um DESCRITIVO TÉCNICO profissional (pt-BR) do projeto a seguir.\n"
+        "TOM: objetivo, impessoal, técnico (nível profissional).\n"
+        "INCLUA: objetivo, antena empregada (modelo/ganho/faixa), composição vertical (N, Δv, tilt, β) e horizontal (N, raio, step, β), frequência de operação, potência, perdas de alimentação (cabo e acessórios) e resumo de desempenho (HPBW, F/B, ripple, SLL, ganho calibrado).\n"
+        "INCLUA TAMBÉM: dados de contato do usuário (nome, e-mail, telefone e endereço).\n"
+        "RESTRIÇÃO: não invente valores; use apenas os fornecidos.\n"
+        "FORMATO: 2 parágrafos curtos (5–10 linhas no total), linguagem direta e precisa.\n\n"
+        f"DADOS EM JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+    )
+
+    if model is None:
+        address = ", ".join(filter(None, [getattr(user, "address_line", None), getattr(user, "city", None), getattr(user, "state", None), getattr(user, "country", None)]))
+        return (
+            f"Projeto {project.name}: antena {project.antenna.name} ({project.antenna.model_number or '—'}), {project.frequency_mhz:.2f} MHz, "
+            f"TX {project.tx_power_w:.1f} W, torre {project.tower_height_m:.2f} m. Vertical: {project.v_count} elem, Δv={project.v_spacing_m:.3f} m, tilt={project.v_tilt_deg or 0:.2f}°. "
+            f"Horizontal: {project.h_count} elem, raio={project.h_spacing_m:.3f} m, step={project.h_step_deg or 0:.2f}°. Cabo {(cable.model_code if cable else project.cable_type) or '—'} ({project.cable_length_m:.2f} m), perdas totais {project.feeder_loss_db or 0:.2f} dB.\n"
+            f"Contato: {getattr(user, 'full_name', '—')} – {getattr(user, 'email', '—')} – {getattr(user, 'phone', '—')} – {address or ''}."
+        )
+    try:
+        resp = model.generate_content([prompt])
+        text = getattr(resp, "text", None) or ""
+        if not text and getattr(resp, "candidates", None):
+            for cand in resp.candidates:
+                parts = getattr(getattr(cand, "content", None), "parts", None)
+                if parts:
+                    for p in parts:
+                        if getattr(p, "text", None):
+                            text += p.text
+        return (text or "").strip()
+    except Exception:
+        return ""
+
+
+def resolve_antenna_image(antenna) -> Path | None:
+    docs_dir = resource_path("docs")
+    if not docs_dir.exists():
+        return None
+
+    name_tokens = re.split(r"[^a-z0-9]+", (antenna.model_number or antenna.name or "").lower())
+    name_tokens = [token for token in name_tokens if token]
+    image_exts = {".png", ".jpg", ".jpeg", ".webp"}
+
+    best_match = None
+    for path in docs_dir.rglob("*"):
+        if path.suffix.lower() not in image_exts:
+            continue
+        stem = path.stem.lower()
+        if name_tokens and all(token in stem for token in name_tokens):
+            best_match = path
+            break
+        if best_match is None:
+            best_match = path
+    return best_match
+
+
+class ExportPaths:
+    def __init__(self, root: Path, project: Project) -> None:
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        self.base_dir = root / str(project.id) / timestamp
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.pat = self.base_dir / "pattern.pat"
+        self.prn = self.base_dir / "pattern.prn"
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", project.name).strip("-") or "relatorio"
+        self.pdf = self.base_dir / f"{safe_name}.pdf"
+        self.composition_vertical = self.base_dir / "composicao_vertical.png"
+        self.composition_horizontal = self.base_dir / "composicao_horizontal.png"
+
+
+def _save_vertical_composition(path: Path, v_count: int, v_spacing_m: float, v_tilt_deg: float) -> None:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    fig, ax = plt.subplots(figsize=(4.0, 5.0))
+    ax.set_aspect('equal')
+    ax.axis('off')
+    count = max(int(v_count or 1), 1)
+    spacing = float(v_spacing_m or 0.0)
+    ymin, ymax = 0.0, 8.0
+    usable = max(ymax - ymin, 1e-6)
+    pitch = usable / max(count - 1, 1)
+    rect_h = 0.9
+    rect_w = 2.4
+    x0 = -rect_w/2
+    for i in range(count):
+        y = ymin + i * pitch
+        rect = patches.Rectangle((x0, y - rect_h/2), rect_w, rect_h, linewidth=1, edgecolor='#cc0000', facecolor='#ffcccc')
+        ax.add_patch(rect)
+    if count >= 2:
+        c0 = ymin
+        c1 = ymin + pitch
+        ax.annotate('', xy=(rect_w/2 + 0.6, c0), xytext=(rect_w/2 + 0.6, c1), arrowprops=dict(arrowstyle='<->', color='#444'))
+        ax.text(rect_w/2 + 0.85, (c0+c1)/2, f"Δv = {spacing:.3f} m", rotation=90, va='center', fontsize=9)
+    tilt = float(v_tilt_deg or 0.0)
+    cy = ymin + (max(count - 1, 0) * pitch) / 2
+    ax.annotate('', xy=(0.0 + 2.0*np.cos(-np.deg2rad(tilt)), cy + 2.0*np.sin(-np.deg2rad(tilt))),
+                xytext=(0.0, cy), arrowprops=dict(arrowstyle='->', linewidth=2, color='#ff7a00'))
+    ax.text(0.2, cy + 0.2, f"tilt {tilt:.1f}°", color='#ff7a00')
+    ax.set_xlim(-3.5, 3.5)
+    ax.set_ylim(ymin - 0.8, ymax + 0.8)
+    fig.savefig(path, dpi=220, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _save_horizontal_composition(path: Path, h_count: int, h_spacing_m: float, h_step_deg: float) -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import matplotlib.patches as patches
+    from matplotlib.transforms import Affine2D
+    fig, ax = plt.subplots(figsize=(5.0, 5.0))
+    ax.set_aspect('equal')
+    ax.axis('off')
+    n = max(int(h_count or 1), 1)
+    Rm = float(h_spacing_m or 0.0)
+    step = float(h_step_deg or 0.0)
+    R = 0.8 + 1.6 * (Rm / (Rm + 1.0))
+    circ = patches.Circle((0,0), R, fill=False, linestyle='--', color='#8a8a8a')
+    ax.add_patch(circ)
+    ax.text(-0.2, R + 0.25, f"R = {Rm:.3f} m", fontsize=9, color='#555')
+    el_w, el_h = 0.35, 0.25
+    for i in range(n):
+        ang_deg = i * (360.0 / n) + step
+        ang = np.deg2rad(ang_deg)
+        xc = (R + el_w/2) * np.cos(ang)
+        yc = (R + el_w/2) * np.sin(ang)
+        rect = patches.Rectangle((-el_w/2, -el_h/2), el_w, el_h,
+                                 linewidth=1, edgecolor='#cc0000', facecolor='#ffcccc')
+        t = Affine2D().rotate(ang).translate(xc, yc) + ax.transData
+        rect.set_transform(t)
+        ax.add_patch(rect)
+        lx = (R + el_w + 0.35) * np.cos(ang)
+        ly = (R + el_w + 0.35) * np.sin(ang)
+        ax.text(lx, ly, f"{(ang_deg)%360:.0f}°", ha='center', va='center', fontsize=8)
+    ax.set_xlim(-3.0, 3.0); ax.set_ylim(-3.0, 3.0)
+    fig.savefig(path, dpi=220, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _format_value(value: float, suffix: str = "") -> str:
+    if value is None or not np.isfinite(value):
+        return f"N/A{suffix}"
+    return f"{value:.2f}{suffix}"
+
+
+def _safe_float(value) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def angles_to_full_circle(angles_deg: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    base_angles = (angles_deg + 360.0) % 360.0
+    order = np.argsort(base_angles)
+    base_angles = base_angles[order]
+    base_values = values[order]
+    extended_angles = np.concatenate([base_angles, base_angles[:1] + 360.0])
+    extended_values = np.concatenate([base_values, base_values[:1]])
+    target = np.arange(0, 360, 1, dtype=float)
+    interp_values = np.interp(target, extended_angles, extended_values)
+    return target, interp_values
+
+
+def vertical_to_full_circle(angles_deg: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    shifted = angles_deg + 90.0
+    base = np.clip(shifted, 0, 180)
+    target = np.arange(0, 181, 1, dtype=float)
+    interp = np.interp(target, base, values, left=values[0], right=values[-1])
+    mirrored = interp[1:-1][::-1]
+    angles = np.concatenate([target, np.arange(181, 360, 1, dtype=float)])
+    amp = np.concatenate([interp, mirrored])
+    return angles, amp
+
+
+def _interp_dict_num(d: dict, x: float) -> float | None:
+    try:
+        items = sorted((float(k), float(v)) for k, v in d.items() if v is not None)
+    except Exception:
+        return None
+    if not items:
+        return None
+    if len(items) == 1:
+        return items[0][1]
+    if x <= items[0][0]:
+        x0, y0 = items[0]
+        x1, y1 = items[1]
+        if x1 == x0:
+            return y0
+        t = (x - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
+    if x >= items[-1][0]:
+        x0, y0 = items[-2]
+        x1, y1 = items[-1]
+        if x1 == x0:
+            return y1
+        t = (x - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
+    for i in range(len(items) - 1):
+        x0, y0 = items[i]
+        x1, y1 = items[i + 1]
+        if x0 <= x <= x1:
+            if x1 == x0:
+                return y0
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return None
+
+
+def _save_polar_plot(path: Path, angles: np.ndarray, values: np.ndarray, title: str) -> None:
+    angles_mod = (angles + 360.0) % 360.0
+    order = np.argsort(angles_mod)
+    theta_sorted = angles_mod[order]
+    values_sorted = values[order]
+    theta_wrapped = np.concatenate([theta_sorted, [theta_sorted[0] + 360.0]])
+    values_wrapped = np.concatenate([values_sorted, [values_sorted[0]]])
+    theta_rad = np.deg2rad(theta_wrapped)
+
+    fig = plt.figure(figsize=(4.5, 4.5))
+    ax = fig.add_subplot(111, projection="polar")
+    ax.plot(theta_rad, values_wrapped, linewidth=1.6, color="#0A4E8B")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_planar_plot(
+    path: Path,
+    angles: np.ndarray,
+    values: np.ndarray,
+    title: str,
+    highlight: tuple[float, float] | None = None,
+) -> None:
+    order = np.argsort(angles)
+    fig, ax = plt.subplots(figsize=(5.5, 3.5))
+    ax.plot(angles[order], values[order], linewidth=1.6, color="#0A4E8B")
+    ax.set_xlabel("Angulo (deg)")
+    ax.set_ylabel("Amplitude (linear)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    if highlight is not None:
+        angle, amplitude = highlight
+        ax.scatter([angle], [amplitude], color="#D35400", s=40, zorder=5)
+        ax.axvline(angle, color="#D35400", linestyle="--", linewidth=1, alpha=0.6)
+        ax.axhline(amplitude, color="#D35400", linestyle="--", linewidth=1, alpha=0.6)
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _build_table_chunks(angles: np.ndarray, values: np.ndarray, available_width: float, columns: int = 6) -> Sequence[Table]:
+    if len(angles) == 0:
+        return []
+    db_vals = lin_to_db(values)
+    rows = [(f"{a:.1f}", f"{v:.4f}", f"{d:.2f}") for a, v, d in zip(angles, values, db_vals)]
+    rows_per_col = math.ceil(len(rows) / columns)
+    header = ["Angulo", "Amplitude", "dB"]
+    table_data = [header * columns]
+    for i in range(rows_per_col):
+        row_cells = []
+        for c in range(columns):
+            idx = i + c * rows_per_col
+            if idx < len(rows):
+                row_cells.extend(rows[idx])
+            else:
+                row_cells.extend(["", "", ""])
+        table_data.append(row_cells)
+
+    base_widths = [2.5, 2.5, 2.0]
+    total_ratio = sum(base_widths) * columns
+    unit = available_width / total_ratio
+    col_widths = [unit * r for r in base_widths] * columns
+
+    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.gray),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+    ] + [
+        ("BACKGROUND", (c * 3, 0), (c * 3 + 2, 0), colors.HexColor("#1f2a44"))
+        for c in range(columns)
+    ] + [
+        ("TEXTCOLOR", (c * 3, 0), (c * 3 + 2, 0), colors.white)
+        for c in range(columns)
+    ] + [
+        ("FONTNAME", (c * 3, 0), (c * 3 + 2, 0), "Helvetica-Bold")
+        for c in range(columns)
+    ]))
+    usable_height = A4[1] - 70
+    return table.split(available_width, usable_height)
+
+
+def _prepare_raw_pattern(project: Project, pattern_type: PatternType) -> tuple[np.ndarray, np.ndarray]:
+    pattern = project.antenna.pattern_for(pattern_type)
+    if not pattern:
+        if pattern_type is PatternType.HRP:
+            angles = np.arange(-180, 181, 1, dtype=float)
+        else:
+            angles = np.round(np.arange(-90.0, 90.0 + 0.0001, 0.1), 1)
+        return angles, np.ones_like(angles, dtype=float)
+    angles = np.asarray(pattern.angles_deg, dtype=float)
+    values = np.asarray(pattern.amplitudes_linear, dtype=float)
+    values = np.clip(values, 0.0, None)
+    if pattern_type is PatternType.HRP:
+        return resample_pattern(angles, values, -180, 180, 1)
+    return resample_vertical(angles, values)
+
+
+def _get_project_description(project: Project, metrics: dict | None) -> str:
+    """
+    Prioriza o texto salvo/mostrado na página do projeto,
+    sem passar novamente por IA. Usa fallback somente se não houver nada salvo.
+    """
+    for attr in ("tech_description", "description", "description_text", "generated_description", "long_description", "summary"):
+        txt = getattr(project, attr, None)
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+    # último recurso: fallback determinístico (sem IA) definido em _build_gemini_description
+    return _build_gemini_description(project, metrics)
+
+
+def _create_pdf_report(
+    project: Project,
+    paths: ExportPaths,
+    hrp_angles: np.ndarray,
+    hrp_values: np.ndarray,
+    vrp_angles: np.ndarray,
+    vrp_values: np.ndarray,
+    raw_hrp_angles: np.ndarray,
+    raw_hrp_values: np.ndarray,
+    raw_vrp_angles: np.ndarray,
+    raw_vrp_values: np.ndarray,
+    array_metrics: dict,
+    horizon_value: float,
+    antenna_image: Path | None,
+    description_text: str,   # <<< NOVO: vem da página do projeto
+) -> None:
+    modelo_path = resource_path("modelo.pdf")
+    template_exists = modelo_path.exists()
+    tmp_dir = tempfile.TemporaryDirectory(prefix="eftx_pdf_")
+    try:
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
+        margin = 18 * mm
+        available_width = width - 2 * margin
+
+        # Preparar imagens
+        hrp_img = Path(tmp_dir.name) / "hrp.png"
+        vrp_img = Path(tmp_dir.name) / "vrp.png"
+        _save_polar_plot(hrp_img, hrp_angles, hrp_values, "Padrão Horizontal Composto")
+        _save_planar_plot(vrp_img, vrp_angles, vrp_values, "Padrão Vertical Composto", highlight=(0.0, horizon_value))
+
+        # Salvar diagramas de composição (arquivos também persistem no export)
+        try:
+            _save_vertical_composition(paths.composition_vertical, int(project.v_count or 1), float(project.v_spacing_m or 0.0), float(project.v_tilt_deg or 0.0))
+            _save_horizontal_composition(paths.composition_horizontal, int(project.h_count or 1), float(project.h_spacing_m or 0.0), float(project.h_step_deg or 0.0))
+        except Exception as exc:
+            try:
+                current_app.logger.warning("export.composition_image_failed", extra={"project_id": str(project.id), "error": str(exc)})
+            except Exception:
+                pass
+
+        # =========================
+        # PÁGINA 1: TÍTULO + DESCRITIVO + TABELA
+        # =========================
+        # Título
+        title_y = height - margin
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(width / 2, title_y, project.name)
+        # imagem da antena no topo direito (pequena)
+        if antenna_image and antenna_image.exists():
+            try:
+                img_reader = ImageReader(str(antenna_image))
+                img_size = 44 * mm
+                c.drawImage(img_reader, width - margin - img_size, title_y - img_size - 6, width=img_size, height=img_size, preserveAspectRatio=True, mask="auto")
+            except Exception:
+                pass
+
+        # Descritivo técnico
+        y = title_y - 22
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin, y, "Descritivo técnico")
+        y -= 12
+        y = _draw_wrapped_text(c, description_text or "", margin, y, available_width, line_height=12, font_name="Helvetica", font_size=9)
+        y -= 6
+
+        # Parâmetros/tabela
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin, y, "Parâmetros do Sistema e do Cabo")
+        y -= 12
+
+        left_rows = [
+            ("Projeto", project.name),
+            ("Antena", project.antenna.name),
+            ("Modelo", project.antenna.model_number or "—"),
+            ("Frequência", f"{project.frequency_mhz:.2f} MHz"),
+            ("Potência TX", f"{project.tx_power_w:.1f} W"),
+            ("Altura torre", f"{project.tower_height_m:.2f} m"),
+            ("VSWR alvo", f"{project.vswr_target or 0:.2f}"),
+        ]
+        right_rows = [
+            ("Elementos V", f"{project.v_count}"),
+            ("Δv (m)", f"{project.v_spacing_m:.3f}"),
+            ("Tilt V (°)", f"{project.v_tilt_deg or 0:.2f}"),
+            ("Beta V (°)", f"{project.v_beta_deg or 0:.2f}"),
+            ("Nível V", f"{project.v_level_amp or 0:.2f}"),
+            ("Elementos H", f"{project.h_count}"),
+            ("Raio arranjo (m)", f"{project.h_spacing_m:.3f}"),
+            ("Step H (°)", f"{project.h_step_deg or 0:.2f}"),
+            ("Beta H (°)", f"{project.h_beta_deg or 0:.2f}"),
+            ("Nível H", f"{project.h_level_amp or 0:.2f}"),
+        ]
+        cable_lines = []
+        cable = project.cable
+        if cable is not None:
+            att_curve = getattr(cable, "attenuation_db_per_100m_curve", None)
+            att_at_f = _interp_dict_num(att_curve, float(project.frequency_mhz)) if isinstance(att_curve, dict) else None
+            cable_lines = [
+                ("Cabo", cable.display_name or cable.model_code or "—"),
+                ("Modelo", cable.model_code or "—"),
+                ("Bitola", cable.size_inch or "—"),
+                ("Impedância (Ω)", f"{cable.impedance_ohms or 50}"),
+                ("Fabricante", cable.manufacturer or "—"),
+                ("Comprimento (m)", f"{project.cable_length_m:.2f}"),
+                ("Splitters (dB)", f"{project.splitter_loss_db:.2f}"),
+                ("Conectores (dB)", f"{project.connector_loss_db:.2f}"),
+                ("Perda total (dB)", f"{project.feeder_loss_db or 0:.2f}"),
+                ("Aten. curva @f (dB/100m)", f"{att_at_f:.2f}" if att_at_f is not None else "—"),
+            ]
+        else:
+            cable_lines = [
+                ("Cabo", project.cable_type or "—"),
+                ("Comprimento (m)", f"{project.cable_length_m:.2f}"),
+                ("Splitters (dB)", f"{project.splitter_loss_db:.2f}"),
+                ("Conectores (dB)", f"{project.connector_loss_db:.2f}"),
+                ("Perda total (dB)", f"{project.feeder_loss_db or 0:.2f}"),
+            ]
+
+        max_len = max(len(left_rows), len(right_rows), len(cable_lines))
+        while len(left_rows) < max_len: left_rows.append(("", ""))
+        while len(right_rows) < max_len: right_rows.append(("", ""))
+        while len(cable_lines) < max_len: cable_lines.append(("", ""))
+
+        header = ["Projeto", "Valor", "Composição", "Valor", "Cabo", "Valor"]
+        table_data = [header] + [
+            [left_rows[i][0], left_rows[i][1], right_rows[i][0], right_rows[i][1], cable_lines[i][0], cable_lines[i][1]]
+            for i in range(max_len)
+        ]
+        tbl = Table(table_data, colWidths=[36*mm, 42*mm, 36*mm, 28*mm, 28*mm, 42*mm])
+        tbl.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.25, colors.gray),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("ALIGN", (0,0), (-1,0), "CENTER"),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1f2a44")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+            ("LEFTPADDING", (0,0), (-1,-1), 2),
+            ("RIGHTPADDING", (0,0), (-1,-1), 2),
+        ]))
+        w, h = tbl.wrap(available_width, height)
+        # se a tabela não couber, quebra página
+        if y - h < margin:
+            c.showPage()
+            y = height - margin - 6
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(margin, y, "Parâmetros do Sistema e do Cabo (cont.)")
+            y -= 12
+        tbl.drawOn(c, margin, y - h)
+        c.showPage()
+
+        # =========================
+        # PÁGINA 2: DIAGRAMAS + COMPOSIÇÕES + MÉTRICAS
+        # =========================
+        chart_width = (width - margin * 3) / 2
+        chart_height = 130
+        col_l_x = margin
+        col_r_x = margin * 2 + chart_width
+        top_y = height - margin - 4
+
+        # Títulos dos gráficos
+        c.setFont("Helvetica-Bold", 12)
+        c.drawCentredString(col_l_x + chart_width/2, top_y, "Padrão Horizontal (polar)")
+        c.drawCentredString(col_r_x + chart_width/2, top_y, "Padrão Vertical (plano)")
+
+        # gráficos
+        c.drawImage(ImageReader(str(hrp_img)), col_l_x, top_y - chart_height - 8, width=chart_width, height=chart_height, preserveAspectRatio=True, mask="auto")
+        c.drawImage(ImageReader(str(vrp_img)), col_r_x, top_y - chart_height - 8, width=chart_width, height=chart_height, preserveAspectRatio=True, mask="auto")
+
+        # composições abaixo dos respectivos gráficos
+        comp_h = 105
+        block_y = top_y - chart_height - 18
+        c.setFont("Helvetica-Bold", 11)
+        c.drawCentredString(col_l_x + chart_width/2, block_y, "Composição Vertical (ilustração)")
+        c.drawCentredString(col_r_x + chart_width/2, block_y, "Composição Horizontal (ilustração)")
+        c.drawImage(ImageReader(str(paths.composition_vertical)), col_l_x, block_y - comp_h - 8, width=chart_width, height=comp_h, preserveAspectRatio=True, mask="auto")
+        c.drawImage(ImageReader(str(paths.composition_horizontal)), col_r_x, block_y - comp_h - 8, width=chart_width, height=comp_h, preserveAspectRatio=True, mask="auto")
+
+        # métricas por diagrama (HRP à esquerda, VRP à direita)
+        # HRP
+        hrp_hpbw = _safe_float(hpbw_deg(hrp_angles, hrp_values))
+        hrp_fb = _safe_float(front_to_back_db(hrp_angles, hrp_values))
+        hrp_ripple = _safe_float(ripple_p2p_db(hrp_angles, hrp_values))
+        hrp_sll = _safe_float(sidelobe_level_db(hrp_angles, hrp_values))
+        hrp_dir_db = _safe_float(10 * np.log10(directivity_2d_cut(hrp_angles, hrp_values)))
+        hrp_peak = _safe_float(peak_angle_deg(hrp_angles, hrp_values))
+
+        # VRP (usa círculo completo para F/B e diretividade com base no corte vertical)
+        vrp_hpbw = _safe_float(hpbw_deg(vrp_angles, vrp_values))
+        vrp_full_angles, vrp_full_values = vertical_to_full_circle(vrp_angles, vrp_values)
+        vrp_fb = _safe_float(front_to_back_db(vrp_full_angles - 180, vrp_full_values))  # normaliza referência
+        vrp_ripple = _safe_float(ripple_p2p_db(vrp_angles, vrp_values))
+        vrp_sll = _safe_float(sidelobe_level_db(vrp_angles, vrp_values))
+        vrp_dir_db = _safe_float(10 * np.log10(directivity_2d_cut(vrp_angles, vrp_values)))
+        vrp_peak = _safe_float(peak_angle_deg(vrp_angles, vrp_values))
+
+        met_y = block_y - comp_h - 18
+        c.setFont("Helvetica", 9)
+        left_lines = [
+            "HRP (Azimute)",
+            f"- HPBW: {_format_value(hrp_hpbw, ' deg')}",
+            f"- Front/Back: {_format_value(hrp_fb, ' dB')}",
+            f"- Ripple p2p: {_format_value(hrp_ripple, ' dB')}",
+            f"- SLL: {_format_value(hrp_sll, ' dB')}",
+            f"- Diretividade 2D: {_format_value(hrp_dir_db, ' dB')}",
+            f"- Pico @: {_format_value(hrp_peak, ' deg')}",
+        ]
+        right_lines = [
+            "VRP (Elevação)",
+            f"- HPBW: {_format_value(vrp_hpbw, ' deg')}",
+            f"- Front/Back: {_format_value(vrp_fb, ' dB')}",
+            f"- Ripple p2p: {_format_value(vrp_ripple, ' dB')}",
+            f"- SLL: {_format_value(vrp_sll, ' dB')}",
+            f"- Diretividade 2D: {_format_value(vrp_dir_db, ' dB')}",
+            f"- Pico @: {_format_value(vrp_peak, ' deg')}",
+            f"- E/Emax @ 0°: {horizon_value:.4f}",
+        ]
+        for i, line in enumerate(left_lines):
+            c.drawString(col_l_x, met_y - i*12, line)
+        for i, line in enumerate(right_lines):
+            c.drawString(col_r_x, met_y - i*12, line)
+
+        c.showPage()
+
+        # =========================
+        # PÁGINAS 3+: TABELAS
+        # =========================
+        hrp_full_angles, hrp_full_values = angles_to_full_circle(hrp_angles, hrp_values)
+        vrp_full_angles, vrp_full_values = vertical_to_full_circle(vrp_angles, vrp_values)
+        hrp_chunks = _build_table_chunks(hrp_full_angles, hrp_full_values, available_width)
+        vrp_chunks = _build_table_chunks(vrp_full_angles, vrp_full_values, available_width)
+
+        for idx, chunk in enumerate(hrp_chunks):
+            c.setFont("Helvetica-Bold", 14)
+            title = "Tabela HRP" + (" (continuação)" if idx else "")
+            c.drawCentredString(width / 2, height - margin, title)
+            w, h = chunk.wrap(available_width, height - margin * 2)
+            chunk.drawOn(c, margin, height - margin - h - 24)
+            c.showPage()
+
+        for idx, chunk in enumerate(vrp_chunks):
+            c.setFont("Helvetica-Bold", 14)
+            title = "Tabela VRP" + (" (continuação)" if idx else "")
+            c.drawCentredString(width / 2, height - margin, title)
+            w, h = chunk.wrap(available_width, height - margin * 2)
+            chunk.drawOn(c, margin, height - margin - h - 24)
+            c.showPage()
+
+        c.save()
+        buffer.seek(0)
+        content_reader = PdfReader(buffer)
+        writer = PdfWriter()
+        if template_exists:
+            template_bytes = modelo_path.read_bytes()
+            for page in content_reader.pages:
+                template_reader = PdfReader(io.BytesIO(template_bytes))
+                base_page = template_reader.pages[0]
+                base_page.merge_page(page)
+                writer.add_page(base_page)
+        else:
+            for page in content_reader.pages:
+                writer.add_page(page)
+        with paths.pdf.open("wb") as fh:
+            writer.write(fh)
+    finally:
+        tmp_dir.cleanup()
+
+
+def write_pat_array(path: Path, description: str, gain: float, num_elems: int,
+                    angles_0_359: np.ndarray, values_0_359: np.ndarray,
+                    vertical_tail_angles: np.ndarray, vertical_tail_values: np.ndarray) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"'{description}', {gain:.2f}, {num_elems}\n")
+        for ang in range(360):
+            val = float(np.interp(ang, angles_0_359, values_0_359))
+            f.write(f"{ang}, {val:.4f}\n")
+        for ang in [356, 357, 358, 359]:
+            val = float(np.interp(ang, angles_0_359, values_0_359))
+            f.write(f"{ang}, {val:.4f}\n")
+        f.write("999\n")
+        f.write("1, 91\n")
+        f.write("269,\n")
+        for ang in range(0, -91, -1):
+            v = float(np.interp(ang, vertical_tail_angles, vertical_tail_values))
+            f.write(f"{ang:.1f}, {v:.4f}\n")
+
+
+def write_prn(path: Path, name: str, make: str, frequency: float, freq_unit: str,
+              h_width: float, v_width: float, front_to_back: float, gain: float,
+              h_angles: np.ndarray, h_values: np.ndarray,
+              v_angles: np.ndarray, v_values: np.ndarray) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"NAME {name}\n")
+        f.write(f"MAKE {make}\n")
+        f.write(f"FREQUENCY {frequency:.2f} {freq_unit}\n")
+        f.write(f"H_WIDTH {h_width:.2f}\n")
+        f.write(f"V_WIDTH {v_width:.2f}\n")
+        f.write(f"FRONT_TO_BACK {front_to_back:.2f}\n")
+        f.write(f"GAIN {gain:.2f} dBi\n")
+        f.write("TILT MECHANICAL\n")
+        f.write("HORIZONTAL 360\n")
+        for ang in range(360):
+            v = float(np.interp(ang, h_angles, h_values))
+            f.write(f"{ang}\t{lin_to_att_db(v):.4f}\n")
+        f.write("VERTICAL 360\n")
+        for ang in range(360):
+            v = float(np.interp(ang, v_angles, v_values))
+            f.write(f"{ang}\t{lin_to_att_db(v):.4f}\n")
+
+
+def generate_project_export(project: Project, export_root: Path) -> tuple[ProjectExport, ExportPaths]:
+    export_root.mkdir(parents=True, exist_ok=True)
+    composition_arrays, composition_payload = get_composition(project, refresh=True)
+    hrp_angles = composition_arrays.get("angles_deg", np.array([]))
+    hrp_values = composition_arrays.get("hrp_linear", np.array([]))
+    vrp_angles = composition_arrays.get("vrp_angles_deg", np.array([]))
+    vrp_values = composition_arrays.get("vrp_linear", np.array([]))
+
+    ang_full_hrp, val_full_hrp = angles_to_full_circle(hrp_angles, hrp_values)
+    ang_full_vrp, val_full_vrp = vertical_to_full_circle(vrp_angles, vrp_values)
+
+    metrics = {
+        "hrp_hpbw": _safe_float(hpbw_deg(hrp_angles, hrp_values)),
+        "vrp_hpbw": _safe_float(hpbw_deg(vrp_angles, vrp_values)),
+        "front_to_back": _safe_float(front_to_back_db(hrp_angles, hrp_values)),
+        "ripple_db": _safe_float(ripple_p2p_db(hrp_angles, hrp_values)),
+        "sll_db": _safe_float(sidelobe_level_db(hrp_angles, hrp_values)),
+        "peak_angle": _safe_float(peak_angle_deg(hrp_angles, hrp_values)),
+        "gain_dbi": _safe_float(estimate_gain_dbi(hpbw_deg(hrp_angles, hrp_values), hpbw_deg(vrp_angles, vrp_values))),
+        "directivity_db": _safe_float(10 * np.log10(directivity_2d_cut(hrp_angles, hrp_values)) if np.any(hrp_values) else None),
+    }
+    # calibração de ganho por tabela (dBd -> dBi)
+    try:
+        base_nominal_dbi = float((project.antenna.nominal_gain_dbd or 0.0) + 2.15)
+    except Exception:
+        base_nominal_dbi = 0.0
+    table = getattr(project.antenna, "gain_table", None)
+    if isinstance(table, dict):
+        table_dbd = _interp_dict_num(table, float(project.frequency_mhz))
+        if table_dbd is not None:
+            table_dbi = float(table_dbd) + 2.15
+            if metrics["gain_dbi"] is not None:
+                metrics["gain_dbi"] = float(metrics["gain_dbi"]) + (table_dbi - base_nominal_dbi)
+            else:
+                metrics["gain_dbi"] = table_dbi
+
+    horizon_idx = int(np.argmin(np.abs(vrp_angles))) if vrp_angles.size else 0
+    horizon_value = _safe_float(vrp_values[horizon_idx]) if vrp_values.size else None
+
+    export_paths = ExportPaths(export_root, project)
+
+    description_text = _get_project_description(project, metrics)
+
+    # PAT/PRN — mantidos
+    description = project.antenna.name or "EFTX"
+    gain_metric = metrics.get("gain_dbi")
+    gain = gain_metric if gain_metric is not None else float(project.antenna.nominal_gain_dbd or 0.0)
+    num_elems = max(project.h_count or 1, 1) * max(project.v_count or 1, 1)
+
+    tail_angles = np.linspace(0, -90, 91)
+    if vrp_angles.size:
+        tail_values = np.interp(tail_angles, vrp_angles[::-1], vrp_values[::-1], left=vrp_values[-1], right=vrp_values[0])
+    else:
+        tail_values = np.ones_like(tail_angles)
+
+    write_pat_array(
+        export_paths.pat,
+        description,
+        gain,
+        num_elems,
+        ang_full_hrp,
+        val_full_hrp,
+        tail_angles,
+        tail_values,
+    )
+
+    prn_name = project.name
+    prn_make = project.antenna.model_number or "EFTX"
+    frequency = float(project.frequency_mhz)
+    front_to_back = metrics["front_to_back"] if metrics["front_to_back"] is not None else 0.0
+    write_prn(
+        export_paths.prn,
+        prn_name,
+        prn_make,
+        frequency,
+        "MHz",
+        metrics["hrp_hpbw"] if metrics["hrp_hpbw"] is not None else 0.0,
+        metrics["vrp_hpbw"] if metrics["vrp_hpbw"] is not None else 0.0,
+        front_to_back,
+        gain,
+        ang_full_hrp,
+        val_full_hrp,
+        ang_full_vrp,
+        val_full_vrp,
+    )
+
+    raw_hrp_angles, raw_hrp_values = _prepare_raw_pattern(project, PatternType.HRP)
+    raw_vrp_angles, raw_vrp_values = _prepare_raw_pattern(project, PatternType.VRP)
+
+    antenna_img = resolve_antenna_image(project.antenna)
+
+    _create_pdf_report(
+        project,
+        export_paths,
+        hrp_angles,
+        hrp_values,
+        vrp_angles,
+        vrp_values,
+        raw_hrp_angles,
+        raw_hrp_values,
+        raw_vrp_angles,
+        raw_vrp_values,
+        metrics,
+        horizon_value if horizon_value is not None else 0.0,
+        antenna_img,
+        description_text,  # <<< descritivo vindo da página
+    )
+
+    export = ProjectExport(
+        project=project,
+        erp_metadata={**composition_payload, "metrics": metrics},
+        pat_path=str(export_paths.pat.relative_to(export_root)),
+        prn_path=str(export_paths.prn.relative_to(export_root)),
+        pdf_path=str(export_paths.pdf.relative_to(export_root)),
+    )
+    db.session.add(export)
+    db.session.commit()
+    return export, export_paths

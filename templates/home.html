@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AEDT Project Explorer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/home.css') }}">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">AE</div>
+        <div>
+          <div class="brand-title">AEDT Project Explorer</div>
+          <div class="brand-subtitle">Painel SPA</div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-label">Fluxo por etapas</div>
+        <div id="steps-container" class="steps"></div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-label">Status rápido</div>
+        <div class="status-pill" id="status-pill">Aguardando ação</div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="toolbar">
+        <div>
+          <div class="page-title">Dashboard AEDT</div>
+          <div class="page-subtitle">Controle unificado de comandos PyAEDT/Flask</div>
+        </div>
+        <div class="toolbar-actions">
+          <button id="btn-refresh" class="btn ghost">Recarregar layout</button>
+          <button id="btn-mark-done" class="btn primary">Marcar etapa como concluída</button>
+        </div>
+      </header>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Detalhes do comando</div>
+            <div class="panel-subtitle" id="command-subtitle">Escolha um comando na barra lateral.</div>
+          </div>
+        </div>
+        <div class="panel-body" id="command-body">
+          <div class="placeholder">Nenhum comando selecionado.</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Log de ações</div>
+            <div class="panel-subtitle">Últimas interações com a SPA.</div>
+          </div>
+          <button id="btn-clear-log" class="btn ghost small">Limpar log</button>
+        </div>
+        <div class="panel-body log-body" id="log-body"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/home.js') }}"></script>
+</body>
+</html>
